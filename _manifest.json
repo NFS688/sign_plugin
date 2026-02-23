@@ -1,0 +1,10 @@
+{
+  "manifest_version": 1,
+  "name": "签到插件",
+  "version": "0.0.1",
+  "description": "一个签到插件",
+  "author": {
+    "name": "Fnillus1on"
+  },
+  "id": "Fnillus1on.Sign_plugin"
+}
