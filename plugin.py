@@ -277,6 +277,7 @@ class Sign(BaseCommand):
                 if img_bytes:
                     b64_img = base64.b64encode(img_bytes).decode('utf-8')
                     await self.send_image(b64_img)
+                await self.datahandle.close()
                 return True, "签到成功", True
 
             # 若已断签则自动尝试消耗已有补签卡补签（静默，不做提示）

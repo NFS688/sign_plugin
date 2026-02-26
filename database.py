@@ -37,6 +37,20 @@ class SignData:
             )
             """
         )
+        await self.conn.execute(
+            """
+            DELETE FROM sign_data
+            WHERE uid NOT IN (
+                SELECT MAX(uid) FROM sign_data GROUP BY user_id
+            )
+            """
+        )
+        await self.conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_sign_data_user_id
+            ON sign_data(user_id)
+            """
+        )
         await self.conn.commit()
 
     async def _get_user_data(self, user_id: str) -> Optional[Dict[str, Any]]:
@@ -69,15 +83,10 @@ class SignData:
     async def _ensure_user_data(self, user_id: str):
         if not self.conn:
             await self.connect()
-
-        async with self.conn.execute(
-            "SELECT 1 FROM sign_data WHERE user_id = ? LIMIT 1",
+        await self.conn.execute(
+            "INSERT OR IGNORE INTO sign_data (user_id) VALUES (?)",
             (user_id,),
-        ) as cursor:
-            if await cursor.fetchone():
-                return
-
-        await self.conn.execute("INSERT INTO sign_data (user_id) VALUES (?)", (user_id,))
+        )
         await self.conn.commit()
 
     async def _update_user_data(self, user_id: str, **kwargs):
@@ -116,6 +125,7 @@ class SignData:
     async def _close(self):
         if self.conn:
             await self.conn.close()
+            self.conn = None
 
 
 class WalletData:
@@ -178,3 +188,4 @@ class WalletData:
     async def _close(self):
         if self.conn:
             await self.conn.close()
+            self.conn = None

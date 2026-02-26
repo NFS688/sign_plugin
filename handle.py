@@ -204,19 +204,73 @@ class DataHandle:
             return False
 
     async def _update_data(self):
+        sign_conn = None
+        wallet_attached = False
         try:
             new_coins = self._update_coins(self.add_coins)
-            await self.sign_db._update_user_data(
-                self.userid,
-                total_days=self._update_total_days(),
-                last_sign=self._update_last_sign(),
-                continuous_days=self._update_continuous(),
-                impression=self._update_impression(self.add_impression),
-                level=self._update_level(),
+            total_days = self._update_total_days()
+            last_sign = self._update_last_sign()
+            continuous_days = self._update_continuous()
+            impression = self._update_impression(self.add_impression)
+            level = self._update_level()
+
+            if not self.sign_db.conn:
+                await self.sign_db.connect()
+            sign_conn = self.sign_db.conn
+
+            # Ensure both tables are updated in one sqlite transaction.
+            await self.wallet_db._close()
+            await sign_conn.execute(
+                "ATTACH DATABASE ? AS wallet_db",
+                (self.wallet_db.db_path,),
             )
-            await self.wallet_db._update_wallet_data(self.userid, new_coins)
+            wallet_attached = True
+            await sign_conn.execute("BEGIN IMMEDIATE")
+            await sign_conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS wallet_db.wallet_data (
+                    uid INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL UNIQUE,
+                    coins INTEGER DEFAULT 0
+                )
+                """
+            )
+            await sign_conn.execute(
+                "INSERT OR IGNORE INTO sign_data (user_id) VALUES (?)",
+                (self.userid,),
+            )
+            await sign_conn.execute(
+                """
+                UPDATE sign_data
+                SET total_days = ?, last_sign = ?, continuous_days = ?, impression = ?, level = ?
+                WHERE user_id = ?
+                """,
+                (total_days, last_sign, continuous_days, impression, level, self.userid),
+            )
+            await sign_conn.execute(
+                """
+                INSERT INTO wallet_db.wallet_data (user_id, coins)
+                VALUES (?, ?)
+                ON CONFLICT(user_id)
+                DO UPDATE SET coins = excluded.coins
+                """,
+                (self.userid, new_coins),
+            )
+            await sign_conn.commit()
         except Exception as e:
             logger.error(f"更新用户数据出现错误: {e}")
+            if sign_conn:
+                try:
+                    await sign_conn.rollback()
+                except Exception:
+                    pass
+            raise
+        finally:
+            if sign_conn and wallet_attached:
+                try:
+                    await sign_conn.execute("DETACH DATABASE wallet_db")
+                except Exception as e:
+                    logger.warning(f"DETACH wallet_db failed: {e}")
 
 
 def _parse_sign_date(raw_value) -> Optional[datetime.date]:
