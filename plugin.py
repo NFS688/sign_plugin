@@ -98,75 +98,118 @@ class get_sign_background(BaseCommand):
     """获得签到背景图片"""
     command_name = "get_sign_background"
     command_description = "获得今天的签到背景，可通过@指定用户"
-    command_pattern = r"^获得签到背景(?:\s*(?P<target>@<[^:<>]+:[^:<>]+>|@\S+))?$"
+    command_pattern = r"^获得签到背景(?:\s+(?P<target>.+))?$"
+
+    @staticmethod
+    def _unique_order(values: List[str]) -> List[str]:
+        result: List[str] = []
+        seen: set[str] = set()
+        for item in values:
+            value = str(item).strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            result.append(value)
+        return result
+
+    @classmethod
+    def _extract_ids_from_text(cls, text: str) -> List[str]:
+        if not text:
+            return []
+        ids: List[str] = []
+        ids.extend(re.findall(r"\[CQ:at,[^\]]*?(?:qq|id)=(\d+)[^\]]*?\]", text))
+        ids.extend(re.findall(r"@<[^:<>]+:(?P<uid>[^:<>]+)>", text))
+        ids.extend(re.findall(r"(?<!\d)(\d{5,20})(?!\d)", text))
+        return cls._unique_order(ids)
+
+    @classmethod
+    def _collect_ids_from_segments(cls, segment) -> List[str]:
+        result: List[str] = []
+
+        def walk(seg) -> None:
+            if seg is None:
+                return
+
+            seg_type = str(getattr(seg, "type", "") or "")
+            seg_data = getattr(seg, "data", None)
+
+            if seg_type in {"at", "mention", "mention_user"}:
+                if isinstance(seg_data, dict):
+                    for key in ("user_id", "id", "qq", "uid", "target", "account"):
+                        value = str(seg_data.get(key) or "").strip()
+                        if value and value.lower() != "all":
+                            result.append(value)
+                else:
+                    value = str(seg_data or "").strip()
+                    if value and value.lower() != "all":
+                        parsed_ids = cls._extract_ids_from_text(value)
+                        if parsed_ids:
+                            result.extend(parsed_ids)
+                        elif value.isdigit():
+                            result.append(value)
+                return
+
+            if seg_type == "text":
+                result.extend(cls._extract_ids_from_text(str(seg_data or "")))
+                return
+
+            if seg_type == "seglist" and isinstance(seg_data, list):
+                for child in seg_data:
+                    walk(child)
+
+        walk(segment)
+        return cls._unique_order(result)
+
+    def _collect_ids_from_additional_config(self) -> List[str]:
+        add_cfg = getattr(self.message.message_info, "additional_config", None) or {}
+        if not isinstance(add_cfg, dict):
+            return []
+        result: List[str] = []
+        for key in ("at_user_ids", "mentioned_user_ids", "at_users", "mentions"):
+            value = add_cfg.get(key)
+            if isinstance(value, list):
+                for item in value:
+                    text = str(item).strip()
+                    if not text:
+                        continue
+                    parsed_ids = self._extract_ids_from_text(text)
+                    if parsed_ids:
+                        result.extend(parsed_ids)
+                    elif text.isdigit():
+                        result.append(text)
+            elif isinstance(value, str):
+                result.extend(self._extract_ids_from_text(value))
+        return self._unique_order(result)
+
+    def _collect_target_ids(self, extra_text: str = "") -> List[str]:
+        values: List[str] = []
+        values.extend(self._collect_ids_from_segments(getattr(self.message, "message_segment", None)))
+        values.extend(self._collect_ids_from_additional_config())
+        values.extend(self._extract_ids_from_text(str(getattr(self.message, "raw_message", "") or "")))
+        values.extend(self._extract_ids_from_text(str(getattr(self.message, "processed_plain_text", "") or "")))
+        if extra_text:
+            values.extend(self._extract_ids_from_text(extra_text))
+        return self._unique_order(values)
+
+    def _resolve_target_user_id(self) -> str:
+        # 默认取发起者自己
+        default_uid = str(self.message.message_info.user_info.user_id)
+        target_ref = str(self.matched_groups.get("target", "") or "")
+        target_ids = self._collect_target_ids(target_ref)
+        return target_ids[0] if target_ids else default_uid
+
+    @classmethod
+    def _extract_user_id_from_segment(cls, segment) -> Optional[str]:
+        ids = cls._collect_ids_from_segments(segment)
+        return ids[0] if ids else None
 
     @staticmethod
     def _extract_user_id_from_ref(text: str) -> Optional[str]:
         if not text:
             return None
-        match = re.search(r"@<[^:<>]+:(?P<uid>[^:<>]+)>", text)
-        if match:
-            return str(match.group("uid"))
-        return None
 
-    @classmethod
-    def _extract_user_id_from_segment(cls, segment) -> Optional[str]:
-        if segment is None:
-            return None
-
-        seg_type = getattr(segment, "type", "")
-        seg_data = getattr(segment, "data", None)
-
-        if seg_type == "seglist" and isinstance(seg_data, list):
-            for seg in seg_data:
-                uid = cls._extract_user_id_from_segment(seg)
-                if uid:
-                    return uid
-            return None
-
-        if seg_type in {"at", "mention"}:
-            if isinstance(seg_data, dict):
-                for key in ("user_id", "uid", "qq", "id", "target", "account"):
-                    value = seg_data.get(key)
-                    if value not in (None, "", "all"):
-                        return str(value)
-            if isinstance(seg_data, str):
-                # 兼容 data 里直接携带 uid 或 @<name:id> 格式
-                uid = cls._extract_user_id_from_ref(seg_data)
-                if uid:
-                    return uid
-                if seg_data.isdigit():
-                    return seg_data
-                bracket_uid = re.search(r"[（(](?P<uid>\d+)[）)]", seg_data)
-                if bracket_uid:
-                    return str(bracket_uid.group("uid"))
-            return None
-
-        if seg_type == "text" and isinstance(seg_data, str):
-            return cls._extract_user_id_from_ref(seg_data)
-
-        return None
-
-    def _resolve_target_user_id(self) -> str:
-        # 默认取发起者自己
-        default_uid = str(self.message.message_info.user_info.user_id)
-
-        # 优先使用正则命中的 target 参数
-        target_ref = self.matched_groups.get("target", "")
-        if target_ref:
-            if uid := self._extract_user_id_from_ref(target_ref):
-                return uid
-
-        # 兜底：从整段文本中提取 @<name:id>
-        text = self.message.processed_plain_text or ""
-        if uid := self._extract_user_id_from_ref(text):
-            return uid
-
-        # 进一步兜底：从消息段结构中提取 at 用户
-        if uid := self._extract_user_id_from_segment(getattr(self.message, "message_segment", None)):
-            return uid
-
-        return default_uid
+        ids = get_sign_background._extract_ids_from_text(text)
+        return ids[0] if ids else None
 
     async def execute(self) -> Tuple[bool, Optional[str], bool]:
         userid = self._resolve_target_user_id()
@@ -294,7 +337,7 @@ class SignPlugin(BasePlugin):
         },
         "components": {
             "wallet_name": ConfigField(type=str, default="麦币", description="货币名称"),
-            "enable_impression_replyer": ConfigField(type=bool, default=False, description="启用好感度影响回复 (启用后bot的回复将受到签到好感的的影响)"),
+            "enable_impression_replyer": ConfigField(type=bool, default=True, description="启用好感度影响回复 (启用后bot的回复将受到签到好感的的影响)"),
             "level_word": ConfigField(type=dict,default=DEFAULT_LEVEL, description="好感等级 (总共8级)"),
             "next_score": ConfigField(type=float, default=25, description="每升一个好感等级需要的好感度"),
             "use_local_bg":ConfigField(type=bool, default=False, description="使用本地图库作为签到背景 (请将图片放在插件目录下的resources/custombg目录)"),
