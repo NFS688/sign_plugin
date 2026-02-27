@@ -4,6 +4,7 @@ from typing import (
     Type, 
     Optional
     )
+from decimal import Decimal, ROUND_HALF_UP
 
 from src.plugin_system import (
     BasePlugin, 
@@ -14,6 +15,7 @@ from src.plugin_system import (
     ConfigField,
     ActionActivationType,
     generator_api,
+    person_api,
     MaiMessages,
     BaseEventHandler,
     CustomEventHandlerResult,
@@ -33,7 +35,8 @@ from .handle import (
     get_target_nickname,
     register_resign_cards_to_shop,
 )
-from .draw import ImageGen, init_draw, get_background
+from .database import SignData
+from .draw import ImageGen, init_draw, get_background, ImpressionRankingImageGen, RankingEntry
 
 logger = get_logger("sign")
 
@@ -229,6 +232,160 @@ class get_sign_background(BaseCommand):
             await self.send_text(error)
             return False, "获取失败", True
 
+class ImpressionRanking(BaseCommand):
+    """好感度排行榜"""
+
+    command_name = "impression_ranking"
+    command_description = "查看好感度排行"
+    command_pattern = r"^好感度排行$"
+
+    @staticmethod
+    def _clamp_limit(raw_limit) -> int:
+        try:
+            limit = int(raw_limit)
+        except Exception:
+            limit = 10
+        return max(1, min(50, limit))
+
+    @staticmethod
+    def _sanitize_next_score(raw_next_score) -> Decimal:
+        try:
+            next_score = Decimal(str(raw_next_score))
+        except Exception:
+            next_score = Decimal("25")
+        if next_score <= 0:
+            next_score = Decimal("25")
+        return next_score
+
+    @staticmethod
+    def _calc_level(impression: Decimal, next_score: Decimal) -> int:
+        if next_score <= 0:
+            next_score = Decimal("25")
+        try:
+            level = int(impression / next_score) + 1
+        except Exception:
+            level = 1
+        return max(1, min(8, level))
+
+    @staticmethod
+    def _normalize_display_name(name: str) -> str:
+        cleaned = str(name or "").strip()
+        if not cleaned:
+            return ""
+        if re.match(r"^未知用户[0-9a-fA-F]{2,}$", cleaned):
+            return ""
+        return cleaned
+
+    @staticmethod
+    def _format_decimal(value: Decimal) -> str:
+        return format(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), ".2f")
+
+    async def _resolve_display_name(self, platform: str, user_id: str) -> str:
+        try:
+            person_id = person_api.get_person_id(platform, user_id)
+            if not person_id:
+                return user_id
+
+            person_name = self._normalize_display_name(
+                await person_api.get_person_value(person_id, "person_name", "")
+            )
+            if person_name:
+                return person_name
+
+            nickname = self._normalize_display_name(
+                await person_api.get_person_value(person_id, "nickname", "")
+            )
+            if nickname:
+                return nickname
+        except Exception as e:
+            logger.debug(f"解析排行榜昵称失败 user_id={user_id}: {e}")
+
+        return user_id
+
+    async def execute(self) -> Tuple[bool, Optional[str], bool]:
+        await init_draw()
+
+        limit = self._clamp_limit(self.get_config("components.ranking_limit", 10))
+        next_score = self._sanitize_next_score(self.get_config("components.next_score", 25))
+        max_impression = (next_score * Decimal("8")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+        level_word = self.get_config("components.level_word", DEFAULT_LEVEL)
+        if not isinstance(level_word, dict):
+            level_word = DEFAULT_LEVEL
+
+        platform = str(getattr(self.message.message_info, "platform", "") or "qq").strip() or "qq"
+        sign_db = SignData()
+        try:
+            rows = await sign_db._get_ranking(limit=limit)
+            if not rows:
+                await self.send_text("暂无好感度数据")
+                return True, "暂无好感度数据", True
+
+            entries: List[RankingEntry] = []
+            for index, row in enumerate(rows, start=1):
+                user_id = str((row[0] if len(row) > 0 else "") or "").strip()
+                if not user_id:
+                    continue
+
+                raw_impression = row[1] if len(row) > 1 else 0
+                try:
+                    impression = Decimal(str(raw_impression or 0)).quantize(
+                        Decimal("0.01"), rounding=ROUND_HALF_UP
+                    )
+                except Exception:
+                    impression = Decimal("0.00")
+
+                level = self._calc_level(impression, next_score)
+                attitude = str(level_word.get(f"lv{level}", "未知") or "未知")
+                nickname = await self._resolve_display_name(platform, user_id)
+
+                progress_ratio = float(
+                    max(
+                        Decimal("0"),
+                        min(Decimal("1"), impression / max_impression),
+                    )
+                )
+
+                impression_str = self._format_decimal(impression)
+                max_impression_str = self._format_decimal(max_impression)
+                entries.append(
+                    RankingEntry(
+                        rank=index,
+                        user_id=user_id,
+                        nickname=nickname,
+                        attitude=attitude,
+                        impression_text=impression_str,
+                        progress_text=f"{impression_str}/{max_impression_str}",
+                        progress_ratio=progress_ratio,
+                    )
+                )
+
+            if not entries:
+                await self.send_text("暂无好感度数据")
+                return True, "暂无好感度数据", True
+
+            updated_text = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+            image_gen = ImpressionRankingImageGen(
+                entries=entries,
+                title="好感度排行",
+                max_impression=float(max_impression),
+                updated_text=updated_text,
+            )
+            img_bytes = await image_gen.draw()
+            if not img_bytes:
+                await self.send_text("排行榜图片生成失败，请稍后重试")
+                return False, "排行榜图片生成失败", True
+
+            await self.send_image(base64.b64encode(img_bytes).decode("utf-8"))
+            return True, "好感度排行发送成功", True
+        except Exception as e:
+            logger.error(f"生成好感度排行失败: {e}")
+            logger.error(traceback.format_exc())
+            await self.send_text("生成好感度排行失败，请稍后重试")
+            return False, "生成好感度排行失败", True
+        finally:
+            await sign_db._close()
+
 class Sign(BaseCommand):
     """签到"""
     command_name = "sign"
@@ -280,7 +437,7 @@ class Sign(BaseCommand):
                 await self.datahandle.close()
                 return True, "签到成功", True
 
-            # 若已断签则自动尝试消耗已有补签卡补签（静默，不做提示）
+            # 若已断签则自动尝试消耗已有补签卡补签
             await auto_resign_with_owned_card(str(userid))
             userdata = await self.datahandle.load_data()
 
@@ -341,6 +498,7 @@ class SignPlugin(BasePlugin):
             "enable_impression_replyer": ConfigField(type=bool, default=True, description="启用好感度影响回复 (启用后bot的回复将受到签到好感的的影响)"),
             "level_word": ConfigField(type=dict,default=DEFAULT_LEVEL, description="好感等级 (总共8级)"),
             "next_score": ConfigField(type=float, default=25, description="每升一个好感等级需要的好感度"),
+            "ranking_limit": ConfigField(type=int, default=10, min=1, max=50, description="排行榜人数 (最大50)"),
             "use_local_bg":ConfigField(type=bool, default=False, description="使用本地图库作为签到背景 (请将图片放在插件目录下的resources/custombg目录)"),
             "resign_card_primary_price": ConfigField(type=int, default=100, description="初级补签卡价格"),
             "resign_card_intermediate_price": ConfigField(type=int, default=300, description="中级补签卡价格"),
@@ -360,6 +518,7 @@ class SignPlugin(BasePlugin):
             )
             components.append((Sign.get_command_info(),Sign))
             components.append((get_sign_background.get_command_info(),get_sign_background))
+            components.append((ImpressionRanking.get_command_info(), ImpressionRanking))
 
         if self.get_config("components.enable_impression_replyer", True):
             components.append((ImpressionInjectHandle.get_handler_info(),ImpressionInjectHandle))

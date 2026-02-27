@@ -7,9 +7,9 @@ import random
 import re
 import traceback
 import unicodedata
+from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
-from functools import lru_cache
-from typing import Optional
+from typing import Optional, Dict
 
 import aiohttp
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
@@ -58,6 +58,35 @@ FONT_URL_EN = "https://cdn.jsdelivr.net/gh/ItMarki/linja-waso@main/fonts/linja-w
 logger = get_logger("sign_draw")
 
 _draw_initialized = False
+
+
+def _sanitize_path_token(value: object, default: str = "unknown") -> str:
+    text = str(value or "").strip()
+    if not text:
+        return default
+    cleaned = re.sub(r"[^0-9A-Za-z_-]", "_", text)
+    cleaned = cleaned.strip("_")
+    return cleaned or default
+
+
+def _join_image_path(filename: str) -> str:
+    image_dir_abs = os.path.abspath(IMAGE_DIR)
+    path = os.path.abspath(os.path.join(IMAGE_DIR, filename))
+    if not path.startswith(image_dir_abs + os.sep):
+        raise ValueError(f"非法图片路径: {filename}")
+    return path
+
+
+def _build_background_path(userid: object, date_text: object) -> str:
+    safe_uid = _sanitize_path_token(userid)
+    safe_date = _sanitize_path_token(date_text)
+    return _join_image_path(f"background-{safe_uid}-{safe_date}.png")
+
+
+def _build_sign_cache_path(userid: object, date_text: object) -> str:
+    safe_uid = _sanitize_path_token(userid)
+    safe_date = _sanitize_path_token(date_text)
+    return _join_image_path(f"{safe_uid}-{safe_date}.png")
 
 
 async def init_draw():
@@ -127,7 +156,7 @@ async def download_font(session, url, path):
 
 
 async def get_background(userid, time):
-    path = os.path.join(IMAGE_DIR, f"background-{userid}-{time}.png")
+    path = _build_background_path(userid, time)
     try:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, read_content, path)
@@ -169,6 +198,10 @@ class ImageGen:
 
         self.avatar_data: Optional[bytes] = None
         self.bg_data: Optional[bytes] = None
+        self._font_cache: dict[tuple[str, int], ImageFont.FreeTypeFont | ImageFont.ImageFont] = {}
+        self._font_paths_cache: Optional[
+            tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]]
+        ] = None
 
     async def _prepare_resources(self):
         async with aiohttp.ClientSession() as session:
@@ -178,12 +211,17 @@ class ImageGen:
                 self.bg_data = await self._get_bg(session)
             self.avatar_data = await self._get_avatar(session)
 
-    @lru_cache(256)
     def _get_font(self, path, size):
+        key = (str(path), int(size))
+        cached = self._font_cache.get(key)
+        if cached is not None:
+            return cached
         try:
-            return ImageFont.truetype(path, size)
+            font = ImageFont.truetype(path, size)
         except Exception:
-            return ImageFont.load_default()
+            font = ImageFont.load_default()
+        self._font_cache[key] = font
+        return font
 
     @staticmethod
     def _font_exists(path: str) -> bool:
@@ -307,12 +345,11 @@ class ImageGen:
             clusters.append(current)
         return clusters
 
-    @lru_cache(64)
     def _get_font_paths(
-        self,
-        size: int,
+        self
     ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
-        del size
+        if self._font_paths_cache is not None:
+            return self._font_paths_cache
         local_font_paths = self._collect_local_font_paths()
 
         emoji_paths = self._dedupe_font_paths(
@@ -340,10 +377,11 @@ class ImageGen:
             + SYSTEM_CJK_FONT_PATHS
             + SYSTEM_EMOJI_FONT_PATHS
         )
-        return emoji_paths, cjk_paths, latin_paths, generic_paths
+        self._font_paths_cache = (emoji_paths, cjk_paths, latin_paths, generic_paths)
+        return self._font_paths_cache
 
     def _choose_font(self, cluster: str, size: int):
-        emoji_paths, cjk_paths, latin_paths, generic_paths = self._get_font_paths(size)
+        emoji_paths, cjk_paths, latin_paths, generic_paths = self._get_font_paths()
         if self._contains_emoji(cluster) and emoji_paths:
             return self._get_font(emoji_paths[0], size)
         if self._contains_cjk(cluster) and cjk_paths:
@@ -419,7 +457,7 @@ class ImageGen:
 
     async def _get_bg_local(self):
         try:
-            bg_path = os.path.join(IMAGE_DIR, f"background-{self.userid}-{self.today}.png")
+            bg_path = _build_background_path(self.userid, self.today)
             files = os.listdir(LOCAL_BG_DIR)
             img_files = [f for f in files if f.lower().endswith((".png", ".jpg", ".jpeg"))]
             if not img_files:
@@ -438,7 +476,7 @@ class ImageGen:
 
     async def _get_bg(self, session: aiohttp.ClientSession):
         try:
-            bg_path = os.path.join(IMAGE_DIR, f"background-{self.userid}-{self.today}.png")
+            bg_path = _build_background_path(self.userid, self.today)
             async with session.get(BG_URL, timeout=30) as resp:
                 if resp.status != 200:
                     logger.error(f"图库 API 请求错误: {resp.status}")
@@ -531,21 +569,21 @@ class ImageGen:
     def _get_level(self, level):
         match level:
             case 1:
-                return self.level_word.get("lv1")
+                return self.level_word.get("lv1") or "未知"
             case 2:
-                return self.level_word.get("lv2")
+                return self.level_word.get("lv2") or "未知"
             case 3:
-                return self.level_word.get("lv3")
+                return self.level_word.get("lv3") or "未知"
             case 4:
-                return self.level_word.get("lv4")
+                return self.level_word.get("lv4") or "未知"
             case 5:
-                return self.level_word.get("lv5")
+                return self.level_word.get("lv5") or "未知"
             case 6:
-                return self.level_word.get("lv6")
+                return self.level_word.get("lv6") or "未知"
             case 7:
-                return self.level_word.get("lv7")
+                return self.level_word.get("lv7") or "未知"
             case 8:
-                return self.level_word.get("lv8")
+                return self.level_word.get("lv8") or "未知"
         return "未知"
 
     def _get_streak_bonus_percent(self) -> int:
@@ -686,7 +724,7 @@ class ImageGen:
 
     async def _image_cache(self):
         try:
-            image_path = os.path.join(IMAGE_DIR, f"{self.userid}-{self.today}.png")
+            image_path = _build_sign_cache_path(self.userid, self.today)
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(None, read_content, image_path)
         except FileNotFoundError:
@@ -754,7 +792,7 @@ class ImageGen:
             canvas.paste(shadow, (card_x - 16, card_y - 16), shadow)
             shadow.close()
 
-            # 卡片显示完整背景图（缩放到卡片尺寸），而不是透明覆盖层。
+            # 卡片
             card_img = main_bg.resize((card_w, card_h), Image.Resampling.LANCZOS)
             card_img = self._round_corner(card_img, card_radius)
             canvas.paste(card_img, (card_x, card_y), card_img)
@@ -824,7 +862,7 @@ class ImageGen:
             bridge_y = int(avatar_center_y - bridge_h / 2)
             bridge_radius = 5
 
-            # 纯色半透明连体底座：统一形状一次性上色，避免连接处出现高光拼缝。
+            # 纯色半透明连体底座：统一形状一次性上色，避免连接处出现高光拼缝
             shape_min_x = min(left_block_x, right_block_x, bridge_x)
             shape_min_y = min(left_block_y, right_block_y, bridge_y)
             shape_max_x = max(left_block_x + left_block_size, right_block_x + right_block_w, bridge_x + bridge_w)
@@ -873,7 +911,7 @@ class ImageGen:
             base_layer.close()
             base_alpha.close()
 
-            # 环形描边：先外扩再内缩，确保边框完整连续且连接处不会断边。
+            # 环形描边：先外扩再内缩，确保边框完整连续且连接处不会断边
             stroke_pad = 2
             stroke_source = Image.new("L", (shape_w + stroke_pad * 2, shape_h + stroke_pad * 2), 0)
             stroke_source.paste(shape_mask, (stroke_pad, stroke_pad))
@@ -1061,7 +1099,7 @@ class ImageGen:
             footer = f"Created By MaiBot {MMC_VERSION} & Sign Plugin {PLUGIN_VERSION}"
             self._draw_text_mixed(draw, target_width // 2, target_height - 14, footer, size=20, fill=(225, 232, 242, 220), anchor="mm", shadow_color=(0, 0, 0, 72), shadow_offset=(1, 1))
 
-            image_path = os.path.join(IMAGE_DIR, f"{self.userid}-{self.today}.png")
+            image_path = _build_sign_cache_path(self.userid, self.today)
 
             output = io.BytesIO()
             final_img = canvas.convert("RGB")
@@ -1082,3 +1120,370 @@ class ImageGen:
                 canvas.close()
             if final_img:
                 final_img.close()
+
+
+@dataclass
+class RankingEntry:
+    rank: int
+    user_id: str
+    nickname: str
+    attitude: str
+    impression_text: str
+    progress_text: str
+    progress_ratio: float
+
+
+class ImpressionRankingImageGen:
+    def __init__(
+        self,
+        entries: list[RankingEntry],
+        title: str = "好感度排行",
+        max_impression: float = 200.0,
+        updated_text: str = "",
+    ):
+        self.entries = list(entries or [])
+        self.title = str(title or "好感度排行")
+        self.max_impression = float(max(0.0, max_impression))
+        self.updated_text = str(updated_text or "")
+        self.today = datetime.datetime.now().strftime("%Y-%m-%d")
+        self.avatar_map: Dict[str, bytes] = {}
+
+        self._text_helper = ImageGen(
+            userdata={
+                "user_id": "ranking",
+                "impression": 0,
+                "coins": 0,
+                "last_sign": "",
+                "total_days": 0,
+                "continuous_days": 0,
+                "level": 1,
+            },
+            nickname="ranking",
+        )
+
+    async def draw(self) -> Optional[bytes]:
+        try:
+            await self._prepare_avatars()
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, self._draw_sync)
+        except Exception as e:
+            logger.error(f"排行榜图片生成失败: {e}")
+            logger.error(traceback.format_exc())
+            return None
+
+    async def _prepare_avatars(self) -> None:
+        user_ids = []
+        seen = set()
+        for item in self.entries:
+            uid = str(getattr(item, "user_id", "") or "").strip()
+            if not uid or uid in seen:
+                continue
+            seen.add(uid)
+            user_ids.append(uid)
+
+        if not user_ids:
+            return
+
+        semaphore = asyncio.Semaphore(8)
+        avatar_map: Dict[str, bytes] = {}
+
+        async def fetch_one(session: aiohttp.ClientSession, user_id: str):
+            if not user_id.isdigit():
+                return
+            url = f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=160"
+            try:
+                async with semaphore:
+                    async with session.get(url, timeout=12) as resp:
+                        if resp.status != 200:
+                            return
+                        data = await resp.read()
+                        if data:
+                            avatar_map[user_id] = data
+            except Exception:
+                return
+
+        async with aiohttp.ClientSession() as session:
+            tasks = [fetch_one(session, user_id) for user_id in user_ids]
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        self.avatar_map = avatar_map
+
+    @staticmethod
+    def _clamp_ratio(value: float) -> float:
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except Exception:
+            return 0.0
+
+    def _draw_text(self, draw: ImageDraw.ImageDraw, *args, **kwargs):
+        return self._text_helper._draw_text_mixed(draw, *args, **kwargs)
+
+    def _measure_text(self, text: str, size: int) -> tuple[float, float]:
+        return self._text_helper._measure_text_mixed(text, size)
+
+    def _truncate(self, text: str, size: int, max_width: float) -> str:
+        return self._text_helper._truncate_text_to_width(text, size, max_width)
+
+    def _avatar_text(self, name: str) -> str:
+        clusters = self._text_helper._split_text_clusters(str(name or "").strip())
+        if not clusters:
+            return "#"
+        return clusters[0]
+
+    def _get_avatar_image(self, user_id: str, size: int) -> Optional[Image.Image]:
+        avatar_data = self.avatar_map.get(str(user_id or "").strip())
+        if not avatar_data:
+            return None
+        try:
+            avatar = Image.open(io.BytesIO(avatar_data)).convert("RGBA")
+            avatar = avatar.resize((size, size), Image.Resampling.LANCZOS)
+            return self._text_helper._round_corner(avatar, size // 2)
+        except Exception:
+            return None
+
+    def _draw_background(self, canvas: Image.Image) -> None:
+        width, height = canvas.size
+        draw = ImageDraw.Draw(canvas)
+        top_rgb = (246, 247, 250)
+        bottom_rgb = (236, 240, 247)
+        for y in range(height):
+            t = y / max(1, height - 1)
+            color = (
+                int(top_rgb[0] * (1 - t) + bottom_rgb[0] * t),
+                int(top_rgb[1] * (1 - t) + bottom_rgb[1] * t),
+                int(top_rgb[2] * (1 - t) + bottom_rgb[2] * t),
+                255,
+            )
+            draw.line((0, y, width, y), fill=color)
+
+        overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        odraw = ImageDraw.Draw(overlay)
+        odraw.ellipse((-180, -120, width // 2 + 160, height // 2), fill=(0, 113, 227, 22))
+        odraw.ellipse((width // 3, height // 3, width + 260, height + 260), fill=(52, 199, 89, 16))
+        odraw.ellipse((width // 6, height // 2 - 120, width * 4 // 5, height + 120), fill=(245, 166, 35, 13))
+        overlay = overlay.filter(ImageFilter.GaussianBlur(36))
+        canvas.alpha_composite(overlay)
+        overlay.close()
+
+    def _draw_card(
+        self,
+        draw: ImageDraw.ImageDraw,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        radius: int = 18,
+        fill=(255, 255, 255, 175),
+        outline=(255, 255, 255, 228),
+        outline_width: int = 2,
+    ) -> None:
+        draw.rounded_rectangle((x1, y1, x2, y2), radius=radius, fill=fill, outline=outline, width=outline_width)
+
+    def _draw_sync(self) -> Optional[bytes]:
+        if not self.entries:
+            return None
+
+        width = 1080
+        top_count = min(3, len(self.entries))
+        list_entries = self.entries[top_count:]
+
+        header_h = 160
+        badge_h = 52
+        podium_h = 320 if top_count > 0 else 0
+        list_gap_h = 20 if list_entries else 0
+        row_h = 96
+        row_gap = 12
+        rows_h = 0
+        if list_entries:
+            rows_h = len(list_entries) * row_h + max(0, len(list_entries) - 1) * row_gap
+        footer_h = 58
+        canvas_h = max(820, 40 + header_h + badge_h + 18 + podium_h + list_gap_h + rows_h + footer_h + 30)
+
+        canvas = Image.new("RGBA", (width, canvas_h), (246, 247, 250, 255))
+        self._draw_background(canvas)
+        draw = ImageDraw.Draw(canvas)
+
+        y = 40
+        self._draw_text(draw, width // 2, y, "SIGN PLUGIN", size=20, fill=(0, 113, 227, 220), anchor="mt")
+        y += 28
+        self._draw_text(draw, width // 2, y, self.title, size=62, fill=(29, 29, 31, 245), anchor="mt")
+        y += 118
+        badge_text = f"更新时间 · {self.updated_text}" if self.updated_text else "更新时间 · 未知"
+        badge_w, badge_h_text = self._measure_text(badge_text, 20)
+        badge_pad_x = 18
+        badge_w_total = int(badge_w + badge_pad_x * 2 + 16)
+        badge_x1 = (width - badge_w_total) // 2
+        badge_y1 = y
+        badge_x2 = badge_x1 + badge_w_total
+        badge_y2 = badge_y1 + 36
+        self._draw_card(
+            draw,
+            badge_x1,
+            badge_y1,
+            badge_x2,
+            badge_y2,
+            radius=18,
+            fill=(255, 255, 255, 165),
+            outline=(255, 255, 255, 230),
+            outline_width=1,
+        )
+        dot_cx = badge_x1 + 14
+        dot_cy = badge_y1 + 18
+        draw.ellipse((dot_cx - 4, dot_cy - 4, dot_cx + 4, dot_cy + 4), fill=(52, 199, 89, 240))
+        self._draw_text(draw, dot_cx + 10, badge_y1 + (36 - badge_h_text) // 2, badge_text, size=20, fill=(99, 99, 105, 235))
+
+        y = badge_y2 + 24
+        if top_count > 0:
+            self._draw_card(
+                draw,
+                48,
+                y,
+                width - 48,
+                y + podium_h - 10,
+                radius=28,
+                fill=(255, 255, 255, 145),
+                outline=(255, 255, 255, 220),
+                outline_width=2,
+            )
+            # 基准线下移，给头像和文案留出顶部安全边距，避免超出上边框。
+            podium_center_y = y + podium_h - 12
+            top_entries = self.entries[:top_count]
+            if top_count == 1:
+                layout = [(top_entries[0], width // 2)]
+            elif top_count == 2:
+                layout = [(top_entries[0], width // 2 - 150), (top_entries[1], width // 2 + 150)]
+            else:
+                layout = [(top_entries[1], width // 2 - 220), (top_entries[0], width // 2), (top_entries[2], width // 2 + 220)]
+
+            for item, cx in layout:
+                rank = int(item.rank or 0)
+                block_h = {1: 122, 2: 94, 3: 72}.get(rank, 62)
+                block_w = 164
+                block_x1 = int(cx - block_w // 2)
+                block_x2 = int(cx + block_w // 2)
+                block_y1 = int(podium_center_y - block_h)
+                block_y2 = int(podium_center_y)
+                block_gradient = {
+                    1: ((255, 196, 92, 220), (255, 226, 154, 220)),
+                    2: ((202, 208, 221, 215), (232, 236, 244, 215)),
+                    3: ((212, 152, 103, 215), (238, 195, 152, 215)),
+                }.get(rank, ((224, 230, 242, 210), (241, 245, 251, 210)))
+                block_w_px = max(1, block_x2 - block_x1)
+                block_h_px = max(1, block_y2 - block_y1)
+                grad_layer = Image.new("RGBA", (block_w_px, block_h_px), (0, 0, 0, 0))
+                grad_draw = ImageDraw.Draw(grad_layer)
+                left_c, right_c = block_gradient
+                for gx in range(block_w_px):
+                    t = gx / max(1, block_w_px - 1)
+                    color = (
+                        int(left_c[0] * (1 - t) + right_c[0] * t),
+                        int(left_c[1] * (1 - t) + right_c[1] * t),
+                        int(left_c[2] * (1 - t) + right_c[2] * t),
+                        int(left_c[3] * (1 - t) + right_c[3] * t),
+                    )
+                    grad_draw.line((gx, 0, gx, block_h_px), fill=color)
+
+                block_mask = Image.new("L", (block_w_px, block_h_px), 0)
+                mask_draw = ImageDraw.Draw(block_mask)
+                mask_draw.rounded_rectangle(
+                    (0, 0, block_w_px - 1, block_h_px - 1),
+                    radius=16,
+                    fill=255,
+                )
+                canvas.paste(grad_layer, (block_x1, block_y1), block_mask)
+                grad_layer.close()
+                block_mask.close()
+
+                draw.rounded_rectangle(
+                    (block_x1, block_y1, block_x2, block_y2),
+                    radius=16,
+                    outline=(255, 255, 255, 230),
+                    width=2,
+                )
+                self._draw_text(draw, cx, block_y1 + (block_h // 2) - 8, str(rank), size=38, fill=(58, 58, 60, 235), anchor="mm")
+
+                avatar_size = 82 if rank == 1 else 70
+                av_x1 = int(cx - avatar_size // 2)
+                av_x2 = int(cx + avatar_size // 2)
+                # 为头像下方三行文案预留空间，避免与领奖台重叠。
+                av_y2 = block_y1 - 92
+                av_y1 = av_y2 - avatar_size
+                draw.ellipse((av_x1, av_y1, av_x2, av_y2), fill=(242, 245, 252, 245), outline=(255, 255, 255, 245), width=2)
+                avatar_img = self._get_avatar_image(item.user_id, avatar_size - 4)
+                if avatar_img:
+                    paste_x = av_x1 + (avatar_size - avatar_img.width) // 2
+                    paste_y = av_y1 + (avatar_size - avatar_img.height) // 2
+                    canvas.paste(avatar_img, (paste_x, paste_y), avatar_img)
+                    avatar_img.close()
+                else:
+                    self._draw_text(draw, cx, av_y1 + avatar_size // 2 - 2, self._avatar_text(item.nickname), size=34, fill=(66, 66, 72, 240), anchor="mm")
+
+                text_top = av_y2 + 8
+                name = self._truncate(item.nickname, 20, 176)
+                self._draw_text(draw, cx, text_top, name, size=20, fill=(38, 38, 40, 235), anchor="mt")
+                attitude = self._truncate(f"态度: {item.attitude}", 16, 188)
+                self._draw_text(draw, cx, text_top + 24, attitude, size=16, fill=(112, 112, 118, 226), anchor="mt")
+                self._draw_text(draw, cx, text_top + 46, f"{item.impression_text}", size=18, fill=(66, 66, 72, 230), anchor="mt")
+
+            y += podium_h
+
+        if list_entries:
+            y += 10
+            margin_x = 54
+            card_w = width - margin_x * 2
+            for i, item in enumerate(list_entries):
+                row_y1 = y + i * (row_h + row_gap)
+                row_y2 = row_y1 + row_h
+                row_x1 = margin_x
+                row_x2 = row_x1 + card_w
+
+                self._draw_card(
+                    draw,
+                    row_x1,
+                    row_y1,
+                    row_x2,
+                    row_y2,
+                    radius=18,
+                    fill=(255, 255, 255, 180),
+                    outline=(255, 255, 255, 232),
+                    outline_width=2,
+                )
+
+                self._draw_text(draw, row_x1 + 30, row_y1 + 31, str(item.rank), size=26, fill=(102, 102, 108, 230), anchor="mm")
+
+                avatar_cx = row_x1 + 86
+                avatar_cy = row_y1 + 48
+                draw.ellipse((avatar_cx - 23, avatar_cy - 23, avatar_cx + 23, avatar_cy + 23), fill=(240, 243, 249, 245), outline=(255, 255, 255, 245), width=2)
+                avatar_img = self._get_avatar_image(item.user_id, 42)
+                if avatar_img:
+                    canvas.paste(avatar_img, (avatar_cx - avatar_img.width // 2, avatar_cy - avatar_img.height // 2), avatar_img)
+                    avatar_img.close()
+                else:
+                    self._draw_text(draw, avatar_cx, avatar_cy - 1, self._avatar_text(item.nickname), size=22, fill=(70, 70, 74, 235), anchor="mm")
+
+                name_x = row_x1 + 124
+                name = self._truncate(item.nickname, 24, 350)
+                self._draw_text(draw, name_x, row_y1 + 16, name, size=24, fill=(34, 34, 36, 238), anchor="lt")
+                self._draw_text(draw, name_x, row_y1 + 45, f"态度: {item.attitude}", size=18, fill=(110, 110, 116, 228), anchor="lt")
+
+                bar_x1 = row_x1 + 124
+                bar_x2 = row_x2 - 24
+                bar_y1 = row_y1 + 71
+                bar_y2 = bar_y1 + 10
+                draw.rounded_rectangle((bar_x1, bar_y1, bar_x2, bar_y2), radius=5, fill=(214, 222, 236, 168))
+                fill_ratio = self._clamp_ratio(item.progress_ratio)
+                fill_w = max(8, int((bar_x2 - bar_x1) * fill_ratio))
+                draw.rounded_rectangle((bar_x1, bar_y1, bar_x1 + fill_w, bar_y2), radius=5, fill=(0, 113, 227, 212))
+                self._draw_text(draw, bar_x2, row_y1 + 57, item.progress_text, size=16, fill=(105, 105, 112, 228), anchor="rb")
+
+        footer = f"Created By MaiBot {MMC_VERSION} · Sign Plugin {PLUGIN_VERSION}"
+        self._draw_text(draw, width // 2, canvas_h - 20, footer, size=18, fill=(124, 124, 132, 220), anchor="mm")
+
+        output = io.BytesIO()
+        final_img = canvas.convert("RGB")
+        final_img.save(output, format="PNG")
+        img_data = output.getvalue()
+        final_img.close()
+        canvas.close()
+        return img_data
